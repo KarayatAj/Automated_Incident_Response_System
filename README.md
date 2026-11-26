@@ -1,36 +1,36 @@
 # Automated Incident Response System
 
-An event-driven **SRE Detective Agent** built with Java, Spring Boot, Neo4j Aura, and Vertex AI Gemini on Google Cloud. When a system alert is published, the service pulls live infrastructure context from a Neo4j graph, uses Gemini to generate a root-cause hypothesis and next steps, and records the incident back into the graph.
+An event-driven **Multi-Agent SRE Incident Response System** built with Java, Spring Boot, LangChain4j, Neo4j Aura, and Vertex AI Gemini on Google Cloud. When a system alert arrives, a **Detective Agent** queries live infrastructure topology and incident history in Neo4j via LangChain4j `@Tool` calls, then hands off to a **Responder Agent** that generates a remediation plan and persists a linked `(:Incident)-[:AFFECTS]->` node back into the graph.
 
 ## Architecture
 
 ```text
 Alert (JSON) ──▶ Cloud Pub/Sub (system-incidents)
-                       │  Push (--push-no-wrapper)
+                       │  Authenticated Push (OIDC JWT + --push-no-wrapper)
                        ▼
-                 Cloud Run (Spring Boot /api/webhook)
-                  ├──▶ Neo4j Aura (Fetch topology context)
-                  ├──▶ Vertex AI Gemini (Triage & root-cause analysis)
-                  └──▶ Neo4j Aura (Persist :Incident node)
+                 Cloud Run (Spring Boot /api/webhook — IAM Protected)
+                  ├──▶ DetectiveAgent (LangChain4j + Gemini 3.5 Flash Lite)
+                  │       └──▶ @Tool: getServiceBlastRadius / getRecentIncidents (Neo4j Aura)
+                  └──▶ ResponderAgent (LangChain4j + Gemini 3.5 Flash Lite)
+                          └──▶ @Tool: recordAndLinkIncident ──▶ (:Incident)-[:AFFECTS]->(:Database/:Service)
 ```
 
 ## Tech Stack
 
 * **Application:** Java 17, Spring Boot 4.1.2 (Maven)
-* **AI / LLM:** LangChain4j + Vertex AI Gemini (`gemini-3.5-flash-lite`)
+* **AI / Multi-Agent:** LangChain4j `AiServices` (`@Tool`) + `langchain4j-google-genai` (Vertex AI Gemini `gemini-3.5-flash-lite`)
 * **Graph Database:** Neo4j Aura + Neo4j Java Driver 5.14.0
-* **Cloud Infrastructure:** Google Cloud Run, Cloud Pub/Sub, Secret Manager, Cloud Build, Artifact Registry
+* **Cloud Infrastructure:** Google Cloud Run (IAM-locked), Cloud Pub/Sub (OIDC Push), Secret Manager, Cloud Build, Artifact Registry
 
-## Current Progress & Roadmap
+## Completed Milestones
 
 * [x] Core GCP setup (APIs, Artifact Registry, Secret Manager, IAM roles)
 * [x] Spring Boot webhook (`POST /api/webhook`) deployed to Cloud Run via Buildpacks
 * [x] Cloud Pub/Sub push subscription delivering raw JSON payloads (`--push-no-wrapper`)
 * [x] Neo4j Aura authentication via Secret Manager (`SPRING_NEO4J_AUTHENTICATION_PASSWORD`)
-* [x] End-to-end graph context retrieval, Gemini incident triage, and `(:Incident)` persistence
-* [ ] Link `(:Incident)-[:AFFECTS]->(:Service)` nodes for automated blast-radius visualization
-* [ ] Secure `/api/webhook` with authenticated Pub/Sub push (OIDC / IAM)
-* [ ] Multi-agent tool calling with `langchain4j-google-genai`
+* [x] Multi-agent tool calling (`DetectiveAgent` + `ResponderAgent`) with `langchain4j-google-genai`
+* [x] Automated `(:Incident)-[:AFFECTS]->` graph linking for blast-radius visualization
+* [x] Secured `/api/webhook` with authenticated Pub/Sub push (OIDC / IAM)
 
 ---
 
@@ -38,9 +38,9 @@ Alert (JSON) ──▶ Cloud Pub/Sub (system-incidents)
 
 ### Prerequisites
 * A Google Cloud project with billing enabled and `gcloud` CLI configured
-* A [Neo4j Aura](https://console.neo4j.io) instance (Free tier works) with sample service nodes (e.g., `FrontendApp`, `UserDB`)
+* A [Neo4j Aura](https://console.neo4j.io) instance with sample topology nodes (e.g., `(:Service {name: 'FrontendApp'})-[:DEPENDS_ON]->(:Database {name: 'UserDB'})`)
 
-### 1. Enable APIs & Grant IAM Permissions
+### 1. Enable APIs & Grant Vertex AI Permission
 ```bash
 export PROJECT_ID="<YOUR_GCP_PROJECT_ID>"
 export REGION="asia-south1"
@@ -56,7 +56,6 @@ gcloud services enable \
   aiplatform.googleapis.com \
   secretmanager.googleapis.com
 
-# Allow Cloud Run to invoke Vertex AI Gemini
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role="roles/aiplatform.user"
@@ -72,46 +71,58 @@ gcloud secrets add-iam-policy-binding neo4j-password \
   --role="roles/secretmanager.secretAccessor"
 ```
 
-### 3. Configure the Application
-1. Clone this repository and open `src/main/resources/application.properties`.
-2. Update `spring.neo4j.uri` with your Neo4j Aura URI (do **not** store the password here—it is injected at runtime from Secret Manager).
-3. Update the GCP project ID in `src/main/java/com/example/demo/IncidentController.java` inside `VertexAiGeminiChatModel.builder().project(...)`.
-
-### 4. Deploy to Cloud Run
+### 3. Configure & Deploy Locked-Down Cloud Run Service
+1. Update `spring.neo4j.uri` in `src/main/resources/application.properties` (never store passwords in this file).
+2. Update `.projectId(...)` in `src/main/java/com/example/demo/IncidentController.java`.
+3. Deploy with public access disabled:
 ```bash
 gcloud run deploy agentic-response-app \
   --source . \
   --region $REGION \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
   --set-build-env-vars="GOOGLE_RUNTIME_VERSION=17" \
   --set-secrets="SPRING_NEO4J_AUTHENTICATION_PASSWORD=neo4j-password:latest"
 ```
 
-### 5. Connect Pub/Sub Push & Test End-to-End
+### 4. Wire Authenticated Pub/Sub Push (OIDC)
 ```bash
-SERVICE_URL=$(gcloud run services describe agentic-response-app \
+export INVOKER_SA="pubsub-invoker@${PROJECT_ID}.iam.gserviceaccount.com"
+export SERVICE_URL=$(gcloud run services describe agentic-response-app --region$REGION --format="value(status.url)")
+
+gcloud iam service-accounts create pubsub-invoker --display-name="Pub/Sub Cloud Run Invoker"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountTokenCreator"
+
+gcloud run services add-iam-policy-binding agentic-response-app \
   --region $REGION \
-  --format="value(status.url)")
+  --member="serviceAccount:${INVOKER_SA}" \
+  --role="roles/run.invoker"
 
 gcloud pubsub topics create system-incidents
 
 gcloud pubsub subscriptions create system-incidents-sub \
   --topic=system-incidents \
   --push-endpoint="${SERVICE_URL}/api/webhook" \
-  --push-no-wrapper
-
-# Publish a test incident alert
-gcloud pubsub topics publish system-incidents \
-  --message='{"service":"checkout-api","incident":"high-latency","errorRate":"18%","severity":"CRITICAL"}'
-
-# Inspect Cloud Run logs after ~15 seconds
-gcloud run services logs read agentic-response-app --region $REGION --limit=30
+  --push-no-wrapper \
+  --push-auth-service-account="${INVOKER_SA}"
 ```
 
-Verify the saved triage result in **Neo4j Aura Query**:
+### 5. Test End-to-End & Visualize in Neo4j Aura
+```bash
+# Publish a test incident alert
+gcloud pubsub topics publish system-incidents \
+  --message='{"service":"UserDB","incident":"connection-pool-exhausted","errorRate":"42%","severity":"CRITICAL"}'
+
+# Inspect multi-agent tool execution in Cloud Run logs
+sleep 20
+gcloud run services logs read agentic-response-app --region $REGION --limit=40
+```
+
+Visualize the incident and blast radius in **Neo4j Aura Query**:
 ```cypher
-MATCH (i:Incident)
-RETURN i.createdAt, i.payload, i.analysis
-ORDER BY i.createdAt DESC
-LIMIT 5
+MATCH p = (i:Incident)-[:AFFECTS]->(target)
+OPTIONAL MATCH dep = (target)-[r]-(neighbor)
+RETURN p, dep
 ```
